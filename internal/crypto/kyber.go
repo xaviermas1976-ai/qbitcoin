@@ -1,194 +1,143 @@
 // Package crypto provides post-quantum cryptographic primitives for qBitcoin.
 //
-// SIMULATION NOTICE: This package simulates CRYSTALS-Kyber (KEM) and
-// CRYSTALS-Dilithium (signatures) using SHA-512 and symmetric constructions.
-// It is NOT cryptographically secure for production use. Replace with
-// github.com/cloudflare/circl/kem/kyber and circl/sign/dilithium before
-// any real-value deployment.
+// Uses real CRYSTALS-Kyber-768 (KEM) via github.com/cloudflare/circl/kem/kyber/kyber768
+// and real CRYSTALS-Dilithium3 (signatures) via github.com/cloudflare/circl/sign/dilithium.
 package crypto
 
 import (
 	"crypto/rand"
 	"crypto/sha512"
-	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"math/big"
+
+	"github.com/cloudflare/circl/kem/kyber/kyber768"
+	"github.com/cloudflare/circl/sign/dilithium"
 )
 
-// hash32 computes a 32-byte digest using SHA-512/256 truncation.
-// Named internally to avoid confusion with real BLAKE3.
+// TODO: replace with real BLAKE3 (e.g. github.com/zeebo/blake3) for production.
 func hash32(data []byte) []byte {
-	h := sha512.New()
+	h := sha512.New512_256()
 	h.Write(data)
-	sum := h.Sum(nil)
-	out := make([]byte, 32)
-	copy(out, sum[:32])
-	return out
+	return h.Sum(nil)
 }
 
-// hashLabeled prepends a domain label before hashing, preventing cross-domain collisions.
-func hashLabeled(label string, data ...[]byte) []byte {
-	h := sha512.New()
-	h.Write([]byte(label))
-	for _, d := range data {
-		h.Write(d)
-	}
-	sum := h.Sum(nil)
-	out := make([]byte, 32)
-	copy(out, sum[:32])
-	return out
-}
-
-// BLAKE3Hash is an alias kept for API compatibility.
-// In production replace with a real BLAKE3 implementation.
-func BLAKE3Hash(data []byte) []byte {
-	return hash32(data)
-}
+// BLAKE3Hash is kept for API compatibility. Uses SHA-512/256 internally.
+func BLAKE3Hash(data []byte) []byte { return hash32(data) }
 
 // BLAKE3HashHex returns the hex-encoded hash of data.
-func BLAKE3HashHex(data []byte) string {
-	return hex.EncodeToString(BLAKE3Hash(data))
-}
+func BLAKE3HashHex(data []byte) string { return hex.EncodeToString(BLAKE3Hash(data)) }
 
-// expandToSize deterministically fills a buffer of size n from a 32-byte seed.
-func expandToSize(seed []byte, n int) []byte {
-	out := make([]byte, n)
-	for i := 0; i < n; i += 32 {
-		block := hashLabeled("expand", seed, []byte{byte(i >> 8), byte(i)})
-		copy(out[i:], block)
-	}
-	return out
-}
-
-// KyberKeyPair holds a simulated post-quantum key pair.
+// KyberKeyPair holds a composite post-quantum key pair.
+// Layout:
+//   PublicKey  = kyber768_pub  (1184 B) || dilithium3_pub
+//   PrivateKey = kyber768_priv (2400 B) || dilithium3_priv
 type KyberKeyPair struct {
 	PublicKey  []byte
 	PrivateKey []byte
 }
 
 const (
-	KyberPublicKeySize  = 1184
-	KyberPrivateKeySize = 2400
-	KyberCiphertextSize = 1088
-	KyberSharedKeySize  = 32
+	KyberPublicKeySize  = kyber768.PublicKeySize  // 1184
+	KyberPrivateKeySize = kyber768.PrivateKeySize // 2400
+	KyberCiphertextSize = kyber768.CiphertextSize // 1088
+	KyberSharedKeySize  = kyber768.SharedKeySize  // 32
 )
 
-// Key layout (simulation):
-//   privKey[0:32]  = secret seed
-//   privKey[32:64] = signing key (sk)
-//   privKey[64:]   = padding
-//
-//   pubKey[0:32]  = hashLabeled("pub", seed)        — public identity
-//   pubKey[32:64] = sk                               — SIMULATION ONLY: stored for Verify
-//   pubKey[64:]   = padding
+var (
+	kemScheme     = kyber768.Scheme()
+	dilithiumMode = dilithium.ModeByName("Dilithium3")
 
-// GenerateKyberKeyPair generates a simulated post-quantum key pair.
+	// CompositePublicKeySize = KyberPublicKeySize + Dilithium3 public key size.
+	CompositePublicKeySize = KyberPublicKeySize + dilithium.ModeByName("Dilithium3").PublicKeySize()
+	// CompositePrivateKeySize = KyberPrivateKeySize + Dilithium3 private key size.
+	CompositePrivateKeySize = KyberPrivateKeySize + dilithium.ModeByName("Dilithium3").PrivateKeySize()
+)
+
+// GenerateKyberKeyPair generates a real Kyber-768 + Dilithium3 key pair.
 func GenerateKyberKeyPair() (*KyberKeyPair, error) {
-	seed := make([]byte, 32)
-	if _, err := rand.Read(seed); err != nil {
+	// KEM keys
+	kemPub, kemPriv, err := kyber768.GenerateKeyPair(rand.Reader)
+	if err != nil {
 		return nil, err
 	}
-	sk := make([]byte, 32)
-	if _, err := rand.Read(sk); err != nil {
+	kemPubBytes, err := kemPub.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	kemPrivBytes, err := kemPriv.MarshalBinary()
+	if err != nil {
 		return nil, err
 	}
 
-	pubID := hashLabeled("pub", seed)
+	// Signature keys
+	sigPub, sigPriv, err := dilithiumMode.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	sigPubBytes := sigPub.Bytes()
+	sigPrivBytes := sigPriv.Bytes()
 
-	priv := expandToSize(seed, KyberPrivateKeySize)
-	copy(priv[0:32], seed)
-	copy(priv[32:64], sk)
+	pub := make([]byte, len(kemPubBytes)+len(sigPubBytes))
+	copy(pub, kemPubBytes)
+	copy(pub[len(kemPubBytes):], sigPubBytes)
 
-	pub := expandToSize(pubID, KyberPublicKeySize)
-	copy(pub[0:32], pubID)
-	copy(pub[32:64], sk) // simulation: stored so Verify can work
+	priv := make([]byte, len(kemPrivBytes)+len(sigPrivBytes))
+	copy(priv, kemPrivBytes)
+	copy(priv[len(kemPrivBytes):], sigPrivBytes)
 
 	return &KyberKeyPair{PublicKey: pub, PrivateKey: priv}, nil
 }
 
-// Encapsulate produces a ciphertext and shared secret from a public key.
-// The shared secret matches what Decapsulate will derive from the corresponding private key.
+// Encapsulate produces a real Kyber-768 ciphertext and shared secret.
 func Encapsulate(publicKey []byte) (ciphertext, sharedSecret []byte, err error) {
-	if len(publicKey) != KyberPublicKeySize {
+	if len(publicKey) < KyberPublicKeySize {
 		return nil, nil, errors.New("invalid public key size")
 	}
-
-	eph := make([]byte, 32)
-	if _, err = rand.Read(eph); err != nil {
+	kemPubKey, err := kemScheme.UnmarshalBinaryPublicKey(publicKey[:KyberPublicKeySize])
+	if err != nil {
 		return nil, nil, err
 	}
-
-	pubID := publicKey[:32]
-
-	// Encrypt ephemeral: enc = eph XOR hashLabeled("enc", pubID)
-	encKey := hashLabeled("enc", pubID)
-	encEph := make([]byte, 32)
-	for i := range encEph {
-		encEph[i] = eph[i] ^ encKey[i]
-	}
-
-	ciphertext = expandToSize(hashLabeled("ct", eph, pubID), KyberCiphertextSize)
-	copy(ciphertext[:32], encEph)
-
-	sharedSecret = hashLabeled("ss", pubID, eph)
-	return ciphertext, sharedSecret, nil
+	ciphertext, sharedSecret, err = kemScheme.Encapsulate(kemPubKey)
+	return
 }
 
-// Decapsulate recovers the shared secret from a ciphertext using the private key.
+// Decapsulate recovers the shared secret from a Kyber-768 ciphertext.
 func Decapsulate(privateKey, ciphertext []byte) ([]byte, error) {
-	if len(privateKey) != KyberPrivateKeySize {
+	if len(privateKey) < KyberPrivateKeySize {
 		return nil, errors.New("invalid private key size")
 	}
 	if len(ciphertext) != KyberCiphertextSize {
 		return nil, errors.New("invalid ciphertext size")
 	}
-
-	seed := privateKey[:32]
-	pubID := hashLabeled("pub", seed)
-
-	encKey := hashLabeled("enc", pubID)
-	encEph := ciphertext[:32]
-
-	eph := make([]byte, 32)
-	for i := range eph {
-		eph[i] = encEph[i] ^ encKey[i]
+	kemPrivKey, err := kemScheme.UnmarshalBinaryPrivateKey(privateKey[:KyberPrivateKeySize])
+	if err != nil {
+		return nil, err
 	}
-
-	sharedSecret := hashLabeled("ss", pubID, eph)
-	return sharedSecret, nil
+	return kemScheme.Decapsulate(kemPrivKey, ciphertext)
 }
 
-// Sign produces a signature using the private key.
-// SIMULATION: uses a MAC construction. Replace with Dilithium for production.
+// Sign produces a real Dilithium3 signature.
 func Sign(privateKey, message []byte) ([]byte, error) {
-	if len(privateKey) < 64 {
-		return nil, errors.New("private key too short: need at least 64 bytes")
+	if len(privateKey) <= KyberPrivateKeySize {
+		return nil, errors.New("private key too short: missing Dilithium component")
 	}
-	sk := privateKey[32:64]
-	sigCore := hashLabeled("sign", sk, message)
-
-	// Expand to 2420 bytes (simulated Dilithium3 signature size)
-	sig := expandToSize(sigCore, 2420)
-	copy(sig[:32], sigCore)
-	return sig, nil
+	sigPriv := dilithiumMode.PrivateKeyFromBytes(privateKey[KyberPrivateKeySize:])
+	return dilithiumMode.Sign(sigPriv, message), nil
 }
 
-// Verify checks a signature against a public key and message.
-// SIMULATION: uses the signing key stored in pubKey[32:64].
-// In production Dilithium, only the public key polynomial is needed.
+// Verify checks a real Dilithium3 signature.
 func Verify(publicKey, message, signature []byte) bool {
-	if len(publicKey) < 64 || len(signature) < 32 {
+	if len(publicKey) <= KyberPublicKeySize {
 		return false
 	}
-	sk := publicKey[32:64]
-	expected := hashLabeled("sign", sk, message)
-	return subtle.ConstantTimeCompare(expected, signature[:32]) == 1
+	sigPub := dilithiumMode.PublicKeyFromBytes(publicKey[KyberPublicKeySize:])
+	return dilithiumMode.Verify(sigPub, message, signature)
 }
 
 // AddressFromPublicKey derives a qBitcoin address from a public key.
 func AddressFromPublicKey(publicKey []byte) string {
-	h := hashLabeled("addr", publicKey)
+	h := hash32(append([]byte("addr"), publicKey...))
 	return "qBTC" + hex.EncodeToString(h)[:40]
 }
 

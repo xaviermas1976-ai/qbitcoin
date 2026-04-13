@@ -32,10 +32,10 @@ func TestKyberKeyGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(kp.PublicKey) != crypto.KyberPublicKeySize {
+	if len(kp.PublicKey) != crypto.CompositePublicKeySize {
 		t.Fatalf("bad public key size: %d", len(kp.PublicKey))
 	}
-	if len(kp.PrivateKey) != crypto.KyberPrivateKeySize {
+	if len(kp.PrivateKey) != crypto.CompositePrivateKeySize {
 		t.Fatalf("bad private key size: %d", len(kp.PrivateKey))
 	}
 }
